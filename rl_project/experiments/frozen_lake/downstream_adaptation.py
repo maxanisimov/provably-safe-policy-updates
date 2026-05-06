@@ -36,6 +36,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# ── path setup ──────────────────────────────────────────────────────────────
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _SCRIPT_DIR.parent.parent.parent
+for p in (str(_SCRIPT_DIR), str(_SCRIPT_DIR.parent), str(_PROJECT_ROOT)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
 # Custom utils
 from frozenlake_utils import (
     evaluate_policy,
@@ -46,14 +53,6 @@ from rl_project.utils.gymnasium_utils import plot_episode, plot_state_action_pai
 from rl_project.utils.ppo_utils import PPOConfig, ppo_train
 from rl_project.utils.ewc_ppo import EWCPPOConfig, ewc_ppo_train, compute_ewc_state
 from src.trainer.IntervalTrainer import IntervalTrainer
-
-# ── path setup ──────────────────────────────────────────────────────────────
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_PROJECT_ROOT = _SCRIPT_DIR.parent.parent.parent
-for p in (str(_SCRIPT_DIR), str(_SCRIPT_DIR.parent), str(_PROJECT_ROOT)):
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:

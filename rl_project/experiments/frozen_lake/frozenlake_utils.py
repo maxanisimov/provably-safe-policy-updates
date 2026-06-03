@@ -171,12 +171,107 @@ def make_frozenlake_env(
 # =============================================================================
 # Safety-dataset helpers
 # =============================================================================
-def create_frozenlake_safety_rashomon_dataset(env, task_flag: float = 0.0):
+def _frozenlake_transition_matrix(env) -> np.ndarray:
+    """Return MASA-style transition probabilities for FrozenLake."""
+    n_states = int(env.observation_space.n)
+    n_actions = int(env.action_space.n)
+    transition_matrix = np.zeros((n_states, n_states, n_actions), dtype=np.float64)
+
+    for state in range(n_states):
+        for action in range(n_actions):
+            for prob, next_state, _, _ in env.P[state][action]:
+                transition_matrix[int(next_state), state, action] += float(prob)
+
+    return transition_matrix
+
+
+def _frozenlake_label_fn_from_env(env):
+    """Build a FrozenLake label function for MASA shield synthesis."""
+    desc = env.unwrapped.desc
+    ncol = int(env.unwrapped.ncol)
+
+    def label_fn(obs):
+        state = int(obs)
+        row, col = divmod(state, ncol)
+        cell = desc[row, col]
+        cell = cell.decode("utf-8") if isinstance(cell, (bytes, bytearray)) else str(cell)
+
+        if cell == "H":
+            return {"unsafe", "hole"}
+        if cell == "G":
+            return {"goal"}
+        return set()
+
+    return label_fn
+
+
+def _frozenlake_analytic_safe_action_matrix(
+    grid: list[str],
+    n_actions: int,
+) -> np.ndarray:
+    """Return one-step hole-avoidance safe actions for deterministic FrozenLake."""
+    nrows, ncols = len(grid), len(grid[0])
+    n_states = nrows * ncols
+    safe_actions_by_state = np.zeros((n_states, n_actions), dtype=np.float32)
+
+    def state_to_rc(state: int):
+        return state // ncols, state % ncols
+
+    def rc_to_state(row: int, col: int):
+        return row * ncols + col
+
+    action_deltas = {
+        0: (0, -1),  # Left
+        1: (1, 0),   # Down
+        2: (0, 1),   # Right
+        3: (-1, 0),  # Up
+    }
+    hole_states = {
+        rc_to_state(row, col)
+        for row in range(nrows)
+        for col in range(ncols)
+        if grid[row][col] == "H"
+    }
+
+    for state in range(n_states):
+        row, col = state_to_rc(state)
+        cell = grid[row][col]
+        if cell in ("H", "G"):
+            continue
+
+        for action, (drow, dcol) in action_deltas.items():
+            next_row, next_col = row + drow, col + dcol
+            hits_wall = (
+                next_row < 0
+                or next_row >= nrows
+                or next_col < 0
+                or next_col >= ncols
+            )
+
+            if hits_wall:
+                safe_actions_by_state[state, action] = 1.0
+            else:
+                next_state = rc_to_state(next_row, next_col)
+                if next_state not in hole_states:
+                    safe_actions_by_state[state, action] = 1.0
+
+    return safe_actions_by_state
+
+
+def create_frozenlake_safety_rashomon_dataset(
+    env,
+    task_flag: float = 0.0,
+    use_shield: bool = False,
+):
     """
     Create a TensorDataset containing only safety-critical states and their safe actions.
 
     - X: one-hot observations (optionally with final task-flag dimension)
     - Y: multi-hot vectors of length n_actions, with 1s for safe actions
+
+    If ``use_shield`` is true, safe actions are computed using MASA shield
+    synthesis. Otherwise, they are computed with the original local
+    one-step hole-avoidance rule.
     """
     desc = env.unwrapped.desc
     grid = [
@@ -185,7 +280,7 @@ def create_frozenlake_safety_rashomon_dataset(env, task_flag: float = 0.0):
     ]
     nrows, ncols = len(grid), len(grid[0])
     n_states = nrows * ncols
-    n_actions = 4  # FrozenLake: Left, Down, Right, Up
+    n_actions = int(env.action_space.n)  # FrozenLake: Left, Down, Right, Up
 
     # Infer observation size from env wrapper
     if hasattr(env.observation_space, "shape") and len(env.observation_space.shape) > 0:
@@ -198,52 +293,41 @@ def create_frozenlake_safety_rashomon_dataset(env, task_flag: float = 0.0):
     if obs_dim_local not in (n_states, n_states + 1):
         raise ValueError(f"Unsupported obs_dim={obs_dim_local}. Expected {n_states} or {n_states + 1}.")
 
-    def state_to_rc(s: int):
-        return s // ncols, s % ncols
+    if use_shield:
+        from rl_project.utils.shield_utils import synthesise_shield
 
-    def rc_to_state(r: int, c: int):
-        return r * ncols + c
+        def cost_fn(labels):
+            return 1.0 if "unsafe" in labels else 0.0
 
-    action_deltas = {
-        0: (0, -1),  # Left
-        1: (1, 0),   # Down
-        2: (0, 1),   # Right
-        3: (-1, 0),  # Up
-    }
+        safe_actions_by_state = np.asarray(
+            synthesise_shield(
+                env=env,
+                transition_matrix_fn=_frozenlake_transition_matrix,
+                label_fn=_frozenlake_label_fn_from_env(env),
+                cost_fn=cost_fn,
+            ),
+            dtype=np.float32,
+        )
+    else:
+        safe_actions_by_state = _frozenlake_analytic_safe_action_matrix(
+            grid=grid,
+            n_actions=n_actions,
+        )
 
-    # Identify hole states
-    hole_states = set()
-    for r in range(nrows):
-        for c in range(ncols):
-            if grid[r][c] == "H":
-                hole_states.add(rc_to_state(r, c))
+    if safe_actions_by_state.shape != (n_states, n_actions):
+        raise ValueError(
+            "Safe-action matrix has unexpected shape "
+            f"{safe_actions_by_state.shape}; expected {(n_states, n_actions)}."
+        )
 
     obs_list = []
     label_list = []
 
     for s in range(n_states):
-        r, c = state_to_rc(s)
-        cell = grid[r][c]
+        safe_actions = np.flatnonzero(safe_actions_by_state[s] > 0).tolist()
 
-        # Skip terminal/non-traversable states
-        if cell in ("H", "G"):
-            continue
-
-        safe_actions = []
-        for a, (dr, dc) in action_deltas.items():
-            nr, nc = r + dr, c + dc
-            hits_wall = (nr < 0 or nr >= nrows or nc < 0 or nc >= ncols)
-
-            if hits_wall:
-                # In FrozenLake, wall-hit keeps agent in place (safe)
-                safe_actions.append(a)
-            else:
-                ns = rc_to_state(nr, nc)
-                if ns not in hole_states:
-                    safe_actions.append(a)
-
-        # Keep only safety-critical states (at least one unsafe action exists)
-        if len(safe_actions) == n_actions:
+        # Keep only safety-critical states: some, but not all, actions are safe.
+        if not (0 < len(safe_actions) < n_actions):
             continue
 
         obs = np.zeros(obs_dim_local, dtype=np.float32)

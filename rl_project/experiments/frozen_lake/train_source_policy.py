@@ -179,7 +179,8 @@ def main() -> None:
         print("=" * 60)
         print("  Finetuning source policy for safety …")
         safety_rashomon_dataset = create_frozenlake_safety_rashomon_dataset(
-            make_frozenlake_env(env_map, task_num=0, is_slippery=is_slippery), task_flag=0.0
+            make_frozenlake_env(env_map, task_num=0, is_slippery=is_slippery), task_flag=0.0,
+            use_shield=True,
         )
         finetuning_result_dct = finetune_policy(
             policy=actor,
